@@ -215,7 +215,8 @@ namespace HourglassApp
         public Color InkSecondary;   // Secondary hairline / tick / muted label color
         public Color InkGhost;       // Inactive dot-matrix ghost pixel color
         public Color AccentInk;      // Subtle technical accent (reticle / alarm state)
-        public Color OuterHalo;      // Subtle contrast halo in transparent mode
+        public Color OuterHalo;      // Subtle contrast halo / semi-transparent glass tint
+        public Color GlassTint { get { return OuterHalo; } }
 
         public EInkPalette(
             string name,
@@ -300,7 +301,7 @@ namespace HourglassApp
         // Base canvas dimensions at 1.0x scale
         private const int BaseWidth = 210;
         private const int BaseHeight = 310;
-        public const string AppVersion = "1.1.0";
+        public const string AppVersion = "1.2.0";
         private const string GitHubRepo = "vegitaprince/navigator-hourglass";
         private bool _isCheckingUpdate = false;
 
@@ -353,8 +354,6 @@ namespace HourglassApp
         // UI Controls
         private NotifyIcon _trayIcon;
         private ContextMenuStrip _contextMenu;
-        private ToolStripMenuItem _menuRestoreTop;
-        private ToolStripSeparator _menuRestoreTopSeparator;
         private ToolStripMenuItem _menuStartPause;
         private ToolStripMenuItem _menuMinimizeRestore;
         private ToolStripMenuItem _menuModeTransparent;
@@ -363,6 +362,10 @@ namespace HourglassApp
         private ToolStripMenuItem _menuShowTime;
         private ToolStripMenuItem _menuSound;
         private bool _isMinimizedToTray = false;
+        private int _lastTraySandStep = -1;
+        private int _lastTrayAnimPhase = -1;
+        private TimerState _lastTrayState = TimerState.Ready;
+        private int _lastTrayTheme = -1;
         private readonly List<ToolStripMenuItem> _scaleMenuItems = new List<ToolStripMenuItem>();
         private readonly List<ToolStripMenuItem> _themeMenuItems = new List<ToolStripMenuItem>();
 
@@ -389,7 +392,7 @@ namespace HourglassApp
                     Color.FromArgb(105, 108, 104), // secondary technical gray
                     Color.FromArgb(206, 205, 198), // ghost matrix dots
                     Color.FromArgb(198, 62, 42),   // technical orange-red accent
-                    Color.FromArgb(210, 245, 245, 240)),
+                    Color.FromArgb(105, 240, 239, 233)), // semi-transparent frosted light glass (~41% alpha)
 
                 // 1: Dark Inverted (Backlit OLED / White Ink on Carbon)
                 new EInkPalette(
@@ -401,7 +404,7 @@ namespace HourglassApp
                     Color.FromArgb(132, 138, 146), // secondary tick gray
                     Color.FromArgb(42, 46, 53),    // ghost matrix dots
                     Color.FromArgb(255, 105, 75),  // alarm accent
-                    Color.FromArgb(215, 15, 17, 20)),
+                    Color.FromArgb(112, 20, 23, 28)), // semi-transparent smoked dark glass (~44% alpha)
 
                 // 2: Warm Cream Paper (Braun / Industrial Blueprint)
                 new EInkPalette(
@@ -413,7 +416,7 @@ namespace HourglassApp
                     Color.FromArgb(118, 110, 98),
                     Color.FromArgb(220, 214, 200),
                     Color.FromArgb(210, 75, 35),
-                    Color.FromArgb(210, 248, 244, 234)),
+                    Color.FromArgb(105, 246, 240, 226)),
 
                 // 3: Cockpit Amber (Night Instrument Panel)
                 new EInkPalette(
@@ -425,7 +428,7 @@ namespace HourglassApp
                     Color.FromArgb(148, 104, 32),
                     Color.FromArgb(44, 36, 24),
                     Color.FromArgb(255, 215, 90),
-                    Color.FromArgb(220, 14, 12, 10)),
+                    Color.FromArgb(112, 22, 18, 14)),
 
                 // 4: Phosphor Green (Oscilloscope / Terminal)
                 new EInkPalette(
@@ -437,7 +440,7 @@ namespace HourglassApp
                     Color.FromArgb(54, 138, 86),
                     Color.FromArgb(28, 42, 34),
                     Color.FromArgb(160, 255, 195),
-                    Color.FromArgb(220, 10, 15, 12))
+                    Color.FromArgb(112, 14, 22, 18))
             };
 
             FormBorderStyle = FormBorderStyle.None;
@@ -723,14 +726,16 @@ namespace HourglassApp
             Hide();
             UpdateMenuChecks();
             UpdateTrayTooltip();
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
+            EnsureTimerState();
             if (_trayIcon != null)
             {
                 try
                 {
                     _trayIcon.ShowBalloonTip(
                         2000,
-                        "모래시계 트레이 최소화",
-                        "작업 표시줄 우측 모래시계 아이콘을 우클릭(또는 클릭)하여 다시 열 수 있습니다.",
+                        "모래시계 최소화됨",
+                        "작업 표시줄 우측 모래시계 아이콘에서 모래가 흐르며, 우클릭 메뉴의 [다시 윈도우에 보이기]로 복원할 수 있습니다.",
                         ToolTipIcon.Info);
                 }
                 catch
@@ -751,6 +756,7 @@ namespace HourglassApp
             Activate();
             UpdateMenuChecks();
             UpdateTrayTooltip();
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
             RenderLayeredWindow();
             EnsureTimerState();
         }
@@ -758,15 +764,6 @@ namespace HourglassApp
         private void BuildContextMenu()
         {
             _contextMenu = new ContextMenuStrip();
-
-            _menuRestoreTop = new ToolStripMenuItem("모래시계 화면에 보이기 (복원)", null, (s, e) => RestoreFromTray());
-            _menuRestoreTop.Font = new Font(_contextMenu.Font, FontStyle.Bold);
-            _menuRestoreTop.Visible = false;
-            _contextMenu.Items.Add(_menuRestoreTop);
-
-            _menuRestoreTopSeparator = new ToolStripSeparator();
-            _menuRestoreTopSeparator.Visible = false;
-            _contextMenu.Items.Add(_menuRestoreTopSeparator);
 
             _menuStartPause = new ToolStripMenuItem("시작 (클릭)", null, (s, e) => ToggleStartPause());
             _menuStartPause.Font = new Font(_contextMenu.Font, FontStyle.Bold);
@@ -805,6 +802,7 @@ namespace HourglassApp
                     _themeIndex = idx;
                     UpdateMenuChecks();
                     SaveSettings();
+                    UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
                     RenderLayeredWindow();
                 });
                 item.Tag = idx;
@@ -881,7 +879,7 @@ namespace HourglassApp
 
             _menuMinimizeRestore = new ToolStripMenuItem("최소화 (작업 표시줄 우측 아이콘으로 숨기기)", null, (s, e) =>
             {
-                if (_isMinimizedToTray || !Visible)
+                if (_isMinimizedToTray)
                 {
                     RestoreFromTray();
                 }
@@ -917,13 +915,10 @@ namespace HourglassApp
             else
                 _menuStartPause.Text = "시작 (클릭)";
 
-            bool hiddenInTray = _isMinimizedToTray || (IsHandleCreated && !Visible);
-            if (_menuRestoreTop != null) _menuRestoreTop.Visible = hiddenInTray;
-            if (_menuRestoreTopSeparator != null) _menuRestoreTopSeparator.Visible = hiddenInTray;
             if (_menuMinimizeRestore != null)
             {
-                _menuMinimizeRestore.Text = hiddenInTray
-                    ? "모래시계 화면에 보이기 (복원)"
+                _menuMinimizeRestore.Text = _isMinimizedToTray
+                    ? "다시 윈도우에 보이기"
                     : "최소화 (작업 표시줄 우측 아이콘으로 숨기기)";
             }
 
@@ -947,7 +942,7 @@ namespace HourglassApp
         private void BuildTrayIcon()
         {
             _trayIcon = new NotifyIcon();
-            _trayIcon.Icon = CreateTrayHourglassIcon();
+            _trayIcon.Icon = CreateTrayHourglassIcon(0.0, _state, 0);
             _trayIcon.Text = "모래시계 - " + FormatTime(_remainingSeconds);
             _trayIcon.ContextMenuStrip = _contextMenu;
             _trayIcon.Visible = true;
@@ -966,40 +961,170 @@ namespace HourglassApp
             };
         }
 
-        private Icon CreateTrayHourglassIcon()
+        private void UpdateTrayIconDynamic(long nowMs, bool force)
         {
+            if (_trayIcon == null) return;
+
+            double progress = _totalSeconds > 0.0 ? (1.0 - (_remainingSeconds / _totalSeconds)) : 0.0;
+            if (progress < 0.0) progress = 0.0;
+            if (progress > 1.0) progress = 1.0;
+
+            int sandStep = (int)Math.Round(progress * 24.0);
+            int animPhase = 0;
+            if (_state == TimerState.Running)
+            {
+                animPhase = (int)((nowMs / 150) % 4);
+            }
+            else if (_state == TimerState.Alarm)
+            {
+                animPhase = (int)((nowMs / 220) % 2);
+            }
+
+            if (!force &&
+                sandStep == _lastTraySandStep &&
+                animPhase == _lastTrayAnimPhase &&
+                _state == _lastTrayState &&
+                _themeIndex == _lastTrayTheme)
+            {
+                return;
+            }
+
+            _lastTraySandStep = sandStep;
+            _lastTrayAnimPhase = animPhase;
+            _lastTrayState = _state;
+            _lastTrayTheme = _themeIndex;
+
+            try
+            {
+                Icon newIcon = CreateTrayHourglassIcon(progress, _state, animPhase);
+                Icon oldIcon = _trayIcon.Icon;
+                _trayIcon.Icon = newIcon;
+                if (oldIcon != null)
+                {
+                    oldIcon.Dispose();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private Icon CreateTrayHourglassIcon(double progress, TimerState state, int animPhase)
+        {
+            double rem = 1.0 - progress;
+            if (rem < 0.0) rem = 0.0;
+            if (rem > 1.0) rem = 1.0;
+
+            EInkPalette pal = _themes[_themeIndex];
+            bool isAlarmFlash = (state == TimerState.Alarm && (animPhase % 2 == 0));
+
+            Color cardBg = isAlarmFlash ? Color.FromArgb(255, 220, 62, 42) : pal.PaperBg;
+            Color inkCol = isAlarmFlash ? Color.White : pal.InkPrimary;
+            Color streamAccent = (state == TimerState.Running && !isAlarmFlash) ? pal.AccentInk : inkCol;
+
             using (Bitmap bmp = new Bitmap(32, 32, PixelFormat.Format32bppArgb))
             using (Graphics g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
 
-                using (SolidBrush bgBrush = new SolidBrush(Color.FromArgb(230, 228, 222)))
-                using (Pen inkPen = new Pen(Color.FromArgb(30, 32, 34), 2.2f))
-                using (Brush inkBrush = new SolidBrush(Color.FromArgb(30, 32, 34)))
+                using (SolidBrush bgBrush = new SolidBrush(cardBg))
+                using (SolidBrush glassBrush = new SolidBrush(Color.FromArgb(120, pal.GlassTint.R, pal.GlassTint.G, pal.GlassTint.B)))
+                using (Pen borderPen = new Pen(inkCol, 1.8f))
+                using (Pen glassPen = new Pen(inkCol, 2.0f))
+                using (SolidBrush sandBrush = new SolidBrush(inkCol))
+                using (SolidBrush dropBrush = new SolidBrush(streamAccent))
                 {
-                    g.FillRectangle(bgBrush, 3, 3, 26, 26);
-                    g.DrawRectangle(inkPen, 3, 3, 26, 26);
+                    // Outer badge card
+                    g.FillRectangle(bgBrush, 1, 1, 30, 30);
+                    g.DrawRectangle(borderPen, 1, 1, 30, 30);
 
-                    g.DrawLine(inkPen, 7, 7, 25, 7);
-                    g.DrawLine(inkPen, 7, 25, 25, 25);
+                    // Top & Bottom caps
+                    g.DrawLine(glassPen, 5, 4, 27, 4);
+                    g.DrawLine(glassPen, 5, 28, 27, 28);
 
-                    PointF[] pts = new PointF[]
+                    PointF[] upperPoly = new PointF[]
                     {
-                        new PointF(9, 7),
-                        new PointF(23, 7),
-                        new PointF(17, 16),
-                        new PointF(23, 25),
-                        new PointF(9, 25),
-                        new PointF(15, 16)
+                        new PointF(6f, 4f),
+                        new PointF(26f, 4f),
+                        new PointF(17.5f, 16f),
+                        new PointF(14.5f, 16f)
                     };
-                    g.DrawPolygon(inkPen, pts);
-                    g.FillPolygon(inkBrush, new PointF[]
+                    PointF[] lowerPoly = new PointF[]
                     {
-                        new PointF(10, 24),
-                        new PointF(22, 24),
-                        new PointF(16, 18)
-                    });
+                        new PointF(14.5f, 16f),
+                        new PointF(17.5f, 16f),
+                        new PointF(26f, 28f),
+                        new PointF(6f, 28f)
+                    };
+
+                    g.FillPolygon(glassBrush, upperPoly);
+                    g.FillPolygon(glassBrush, lowerPoly);
+
+                    // 1. Upper Sand (shrinking as time passes)
+                    if (rem > 0.01)
+                    {
+                        float maxH = 11.0f;
+                        float sandH = (float)Math.Pow(rem, 0.72) * maxH;
+                        float topSandY = 16.0f - sandH;
+
+                        using (GraphicsPath upClip = new GraphicsPath())
+                        {
+                            upClip.AddPolygon(upperPoly);
+                            GraphicsState st = g.Save();
+                            g.SetClip(upClip);
+                            g.FillRectangle(sandBrush, 5f, topSandY, 22f, sandH + 1f);
+                            g.Restore(st);
+                        }
+                    }
+
+                    // 2. Lower Sand (growing as time passes)
+                    float botSandTopY = 28.0f;
+                    if (progress > 0.01)
+                    {
+                        float maxH = 11.0f;
+                        float sandH = (float)Math.Pow(progress, 0.78) * maxH;
+                        botSandTopY = 28.0f - sandH;
+
+                        using (GraphicsPath dnClip = new GraphicsPath())
+                        {
+                            dnClip.AddPolygon(lowerPoly);
+                            GraphicsState st = g.Save();
+                            g.SetClip(dnClip);
+                            PointF[] mound = new PointF[]
+                            {
+                                new PointF(16f, Math.Max(16.5f, botSandTopY - 2.2f)),
+                                new PointF(27f, botSandTopY + 1.5f),
+                                new PointF(27f, 29f),
+                                new PointF(5f, 29f),
+                                new PointF(5f, botSandTopY + 1.5f)
+                            };
+                            g.FillPolygon(sandBrush, mound);
+                            g.Restore(st);
+                        }
+                    }
+
+                    // 3. Animated Falling Sand Stream in the Center (visible when Running!)
+                    if (state == TimerState.Running && rem > 0.005)
+                    {
+                        float offset = (animPhase % 4) * 1.6f;
+                        for (float py = 16.2f + offset; py < botSandTopY - 0.5f; py += 3.4f)
+                        {
+                            g.FillRectangle(dropBrush, 14.7f, py, 2.6f, 2.4f);
+                        }
+                    }
+
+                    // Glass contour outline
+                    PointF[] fullPoly = new PointF[]
+                    {
+                        new PointF(6f, 4f),
+                        new PointF(26f, 4f),
+                        new PointF(17.5f, 16f),
+                        new PointF(26f, 28f),
+                        new PointF(6f, 28f),
+                        new PointF(14.5f, 16f)
+                    };
+                    g.DrawPolygon(glassPen, fullPoly);
                 }
 
                 IntPtr hIcon = bmp.GetHicon();
@@ -1076,6 +1201,7 @@ namespace HourglassApp
             }
 
             UpdateTrayTooltip();
+            UpdateTrayIconDynamic(nowMs, false);
             RenderLayeredWindow();
             EnsureTimerState();
         }
@@ -1119,6 +1245,7 @@ namespace HourglassApp
             }
 
             UpdateTrayTooltip();
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
             RenderLayeredWindow();
             EnsureTimerState();
         }
@@ -1135,6 +1262,7 @@ namespace HourglassApp
 
             ShowHudTemporarily("FLIP // " + FormatTime(_totalSeconds), 1300);
             UpdateTrayTooltip();
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
             RenderLayeredWindow();
             EnsureTimerState();
         }
@@ -1148,6 +1276,7 @@ namespace HourglassApp
             {
                 RestoreFromTray();
             }
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
             PlayAlarmChime();
             EnsureTimerState();
         }
@@ -1158,6 +1287,7 @@ namespace HourglassApp
             _remainingSeconds = _totalSeconds;
             ShowHudTemporarily("RESET // " + FormatTime(_totalSeconds), 1300);
             UpdateTrayTooltip();
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
             RenderLayeredWindow();
             EnsureTimerState();
         }
@@ -1182,6 +1312,7 @@ namespace HourglassApp
             SaveSettings();
             ShowHudTemporarily("SET // " + FormatTime(_totalSeconds), 1500);
             UpdateTrayTooltip();
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
             RenderLayeredWindow();
             EnsureTimerState();
         }
@@ -2111,21 +2242,46 @@ namespace HourglassApp
                 });
             }
 
-            // 3. Build Hourglass Chamber Paths (Glass interior is 100% transparent except for outline & sand!)
+            // 3. Build Hourglass Chamber Paths (Softly semi-transparent glass interior + subtle sheen)
             using (GraphicsPath upperBulbPath = CreateUpperBulbPath(cx, topY, neckY, halfW, neckHalfW))
             using (GraphicsPath lowerBulbPath = CreateLowerBulbPath(cx, neckY, botY, halfW, neckHalfW))
             using (GraphicsPath fullGlassPath = CreateFullGlassPath(cx, topY, neckY, botY, halfW, neckHalfW))
             {
-                // Punch out glass interior to be completely transparent even in Panel Mode
                 if (_panelMode)
                 {
                     CompositingMode prevComp = g.CompositingMode;
                     g.CompositingMode = CompositingMode.SourceCopy;
-                    using (SolidBrush clearBrush = new SolidBrush(Color.FromArgb(0, 0, 0, 0)))
+                    using (SolidBrush glassBrush = new SolidBrush(pal.GlassTint))
                     {
-                        g.FillPath(clearBrush, fullGlassPath);
+                        g.FillPath(glassBrush, fullGlassPath);
                     }
                     g.CompositingMode = prevComp;
+                }
+                else
+                {
+                    using (SolidBrush glassBrush = new SolidBrush(pal.GlassTint))
+                    {
+                        g.FillPath(glassBrush, fullGlassPath);
+                    }
+                }
+
+                // Subtle specular glass reflection curves along the left inner walls
+                using (Pen sheenPen = new Pen(Color.FromArgb(62, 255, 255, 255), 1.8f))
+                {
+                    sheenPen.StartCap = LineCap.Round;
+                    sheenPen.EndCap = LineCap.Round;
+                    g.DrawBezier(
+                        sheenPen,
+                        new PointF(cx - halfW + 5.5f, topY + 7f),
+                        new PointF(cx - halfW + 5.5f, topY + (neckY - topY) * 0.45f),
+                        new PointF(cx - neckHalfW - 6f, neckY - (neckY - topY) * 0.25f),
+                        new PointF(cx - neckHalfW - 2.5f, neckY - 5f));
+                    g.DrawBezier(
+                        sheenPen,
+                        new PointF(cx - neckHalfW - 2.5f, neckY + 5f),
+                        new PointF(cx - neckHalfW - 6f, neckY + (botY - neckY) * 0.25f),
+                        new PointF(cx - halfW + 5.5f, botY - (botY - neckY) * 0.45f),
+                        new PointF(cx - halfW + 5.5f, botY - 7f));
                 }
 
                 // 4. Draw Ink + Dot-Matrix Sand & Falling Pixel Stream
@@ -2135,7 +2291,7 @@ namespace HourglassApp
                     cx, topY, neckY, botY, halfW,
                     progress, nowMs);
 
-                // 5. Crisp Technical Glass Wall Contour (Outline only, interior remains transparent)
+                // 5. Crisp Technical Glass Wall Contour
                 Color contourColor = (_state == TimerState.Alarm && ((nowMs / 220) % 2 == 0))
                     ? pal.AccentInk
                     : pal.InkPrimary;

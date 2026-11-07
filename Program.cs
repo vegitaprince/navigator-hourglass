@@ -7,8 +7,12 @@ using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
 using System.Media;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("NAVIGATOR // E-Ink Hourglass")]
@@ -17,8 +21,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Navigator Instruments")]
 [assembly: AssemblyProduct("NAVIGATOR Hourglass Widget")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace HourglassApp
 {
@@ -45,16 +49,45 @@ namespace HourglassApp
                     GenerateMultiSizeIcon(args[1]);
                     return;
                 }
+#if INCLUDE_VIDEO_BUILDER
                 if (args != null && args.Length >= 2 && args[0] == "--make-video")
                 {
                     VideoBuilder.GenerateTutorialVideo(args[1]);
                     return;
                 }
+                if (args != null && args.Length >= 2 && args[0] == "--make-mobile-video")
+                {
+                    VideoBuilder.GenerateMobileTutorialVideo(args[1]);
+                    return;
+                }
+#endif
+                CleanupOldUpdateFiles();
                 Application.Run(new HourglassForm());
             }
             catch (Exception ex)
             {
                 File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "error.log"), ex.ToString());
+            }
+        }
+
+        private static void CleanupOldUpdateFiles()
+        {
+            try
+            {
+                string exePath = Application.ExecutablePath;
+                string oldFile = exePath + ".old";
+                if (File.Exists(oldFile))
+                {
+                    File.Delete(oldFile);
+                }
+                string cmdFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "hourglass_update.cmd");
+                if (File.Exists(cmdFile))
+                {
+                    File.Delete(cmdFile);
+                }
+            }
+            catch
+            {
             }
         }
 
@@ -267,6 +300,9 @@ namespace HourglassApp
         // Base canvas dimensions at 1.0x scale
         private const int BaseWidth = 210;
         private const int BaseHeight = 310;
+        public const string AppVersion = "1.1.0";
+        private const string GitHubRepo = "vegitaprince/navigator-hourglass";
+        private bool _isCheckingUpdate = false;
 
         // 5x7 Dot-Matrix Font Bitmap Table (Each byte array has 7 rows, 5 bits per row: bit 4..0)
         private static readonly Dictionary<char, byte[]> DotFont = BuildDotMatrixFont();
@@ -279,7 +315,7 @@ namespace HourglassApp
         private readonly Stopwatch _clock = Stopwatch.StartNew();
 
         // Animation & Visual State
-        private readonly Timer _animTimer;
+        private readonly System.Windows.Forms.Timer _animTimer;
         private float _scale = 1.0f;
         private bool _alwaysOnTop = true;
         private bool _showDigitalTime = true;
@@ -317,12 +353,16 @@ namespace HourglassApp
         // UI Controls
         private NotifyIcon _trayIcon;
         private ContextMenuStrip _contextMenu;
+        private ToolStripMenuItem _menuRestoreTop;
+        private ToolStripSeparator _menuRestoreTopSeparator;
         private ToolStripMenuItem _menuStartPause;
+        private ToolStripMenuItem _menuMinimizeRestore;
         private ToolStripMenuItem _menuModeTransparent;
         private ToolStripMenuItem _menuModePanel;
         private ToolStripMenuItem _menuAlwaysOnTop;
         private ToolStripMenuItem _menuShowTime;
         private ToolStripMenuItem _menuSound;
+        private bool _isMinimizedToTray = false;
         private readonly List<ToolStripMenuItem> _scaleMenuItems = new List<ToolStripMenuItem>();
         private readonly List<ToolStripMenuItem> _themeMenuItems = new List<ToolStripMenuItem>();
 
@@ -417,7 +457,7 @@ namespace HourglassApp
             BuildContextMenu();
             BuildTrayIcon();
 
-            _animTimer = new Timer();
+            _animTimer = new System.Windows.Forms.Timer();
             _animTimer.Interval = 50;
             _animTimer.Tick += OnAnimTimerTick;
 
@@ -448,6 +488,7 @@ namespace HourglassApp
             TopMost = _alwaysOnTop;
             ShowHudTemporarily("WHEEL: SET / CLICK: RUN", 2400);
             RenderLayeredWindow();
+            CheckForUpdatesAsync(false);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -676,9 +717,56 @@ namespace HourglassApp
         // =====================================================================
         // Context Menu & System Tray Icon
         // =====================================================================
+        private void MinimizeToTray()
+        {
+            _isMinimizedToTray = true;
+            Hide();
+            UpdateMenuChecks();
+            UpdateTrayTooltip();
+            if (_trayIcon != null)
+            {
+                try
+                {
+                    _trayIcon.ShowBalloonTip(
+                        2000,
+                        "모래시계 트레이 최소화",
+                        "작업 표시줄 우측 모래시계 아이콘을 우클릭(또는 클릭)하여 다시 열 수 있습니다.",
+                        ToolTipIcon.Info);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void RestoreFromTray()
+        {
+            _isMinimizedToTray = false;
+            Show();
+            if (WindowState == FormWindowState.Minimized)
+            {
+                WindowState = FormWindowState.Normal;
+            }
+            TopMost = _alwaysOnTop;
+            Activate();
+            UpdateMenuChecks();
+            UpdateTrayTooltip();
+            RenderLayeredWindow();
+            EnsureTimerState();
+        }
+
         private void BuildContextMenu()
         {
             _contextMenu = new ContextMenuStrip();
+
+            _menuRestoreTop = new ToolStripMenuItem("모래시계 화면에 보이기 (복원)", null, (s, e) => RestoreFromTray());
+            _menuRestoreTop.Font = new Font(_contextMenu.Font, FontStyle.Bold);
+            _menuRestoreTop.Visible = false;
+            _contextMenu.Items.Add(_menuRestoreTop);
+
+            _menuRestoreTopSeparator = new ToolStripSeparator();
+            _menuRestoreTopSeparator.Visible = false;
+            _contextMenu.Items.Add(_menuRestoreTopSeparator);
 
             _menuStartPause = new ToolStripMenuItem("시작 (클릭)", null, (s, e) => ToggleStartPause());
             _menuStartPause.Font = new Font(_contextMenu.Font, FontStyle.Bold);
@@ -791,8 +879,24 @@ namespace HourglassApp
 
             _contextMenu.Items.Add(new ToolStripSeparator());
 
+            _menuMinimizeRestore = new ToolStripMenuItem("최소화 (작업 표시줄 우측 아이콘으로 숨기기)", null, (s, e) =>
+            {
+                if (_isMinimizedToTray || !Visible)
+                {
+                    RestoreFromTray();
+                }
+                else
+                {
+                    MinimizeToTray();
+                }
+            });
+            _contextMenu.Items.Add(_menuMinimizeRestore);
+
             var menuHelp = new ToolStripMenuItem("조작 방법 안내", null, (s, e) => ShowHelpMessage());
             _contextMenu.Items.Add(menuHelp);
+
+            var menuUpdate = new ToolStripMenuItem("업데이트 확인 (현재 v" + AppVersion + ")", null, (s, e) => CheckForUpdatesAsync(true));
+            _contextMenu.Items.Add(menuUpdate);
 
             var menuExit = new ToolStripMenuItem("종료", null, (s, e) => Close());
             _contextMenu.Items.Add(menuExit);
@@ -812,6 +916,16 @@ namespace HourglassApp
                 _menuStartPause.Text = "알람 끄기 (클릭)";
             else
                 _menuStartPause.Text = "시작 (클릭)";
+
+            bool hiddenInTray = _isMinimizedToTray || (IsHandleCreated && !Visible);
+            if (_menuRestoreTop != null) _menuRestoreTop.Visible = hiddenInTray;
+            if (_menuRestoreTopSeparator != null) _menuRestoreTopSeparator.Visible = hiddenInTray;
+            if (_menuMinimizeRestore != null)
+            {
+                _menuMinimizeRestore.Text = hiddenInTray
+                    ? "모래시계 화면에 보이기 (복원)"
+                    : "최소화 (작업 표시줄 우측 아이콘으로 숨기기)";
+            }
 
             _menuModeTransparent.Checked = !_panelMode;
             _menuModePanel.Checked = _panelMode;
@@ -837,12 +951,13 @@ namespace HourglassApp
             _trayIcon.Text = "모래시계 - " + FormatTime(_remainingSeconds);
             _trayIcon.ContextMenuStrip = _contextMenu;
             _trayIcon.Visible = true;
+            _trayIcon.BalloonTipClicked += (s, e) => RestoreFromTray();
+            _trayIcon.MouseDoubleClick += (s, e) => RestoreFromTray();
             _trayIcon.MouseClick += (s, e) =>
             {
                 if (e.Button == MouseButtons.Left)
                 {
-                    Show();
-                    Activate();
+                    RestoreFromTray();
                     if (_state == TimerState.Alarm)
                     {
                         StopAlarmAndReset();
@@ -1029,6 +1144,10 @@ namespace HourglassApp
             _state = TimerState.Alarm;
             _alarmStartMs = _clock.ElapsedMilliseconds;
             _lastSoundPlayMs = _alarmStartMs;
+            if (_isMinimizedToTray || !Visible)
+            {
+                RestoreFromTray();
+            }
             PlayAlarmChime();
             EnsureTimerState();
         }
@@ -1300,7 +1419,7 @@ namespace HourglassApp
         private void ShowHelpMessage()
         {
             string msg =
-                "⏳ NAVIGATOR // E-INK 모래시계 조작 안내\n\n" +
+                "⏳ NAVIGATOR // E-INK 모래시계 (v" + AppVersion + ") 조작 안내\n\n" +
                 "• 왼쪽 클릭 : 시작 / 일시정지 / 알람 해제\n" +
                 "• 더블 클릭 : 모래시계 180° 뒤집기 (재시작)\n" +
                 "• 드래그 : 원하는 위치로 이동\n" +
@@ -1310,9 +1429,307 @@ namespace HourglassApp
                 "   - Ctrl + 휠 : 크기 확대/축소\n" +
                 "• 단축키 M (또는 우클릭) : '투명 라인아트 모드' ↔ 'E-Ink 패널 모드' 전환\n" +
                 "• 휠 클릭(가운데 버튼) : 하단 도트 타이머 표시 켜기/끄기\n" +
-                "• 우클릭 : 라이트 잉크 / 다크 반전 테마 및 환경설정";
+                "• 우클릭 → 최소화 : 작업 표시줄 우측 트레이 아이콘으로 숨기기/복원\n" +
+                "• 우클릭 : 테마 변경, 빠른 시간 선택, 자동 업데이트 확인";
 
             MessageBox.Show(this, msg, "모래시계 도움말", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // =====================================================================
+        // GitHub Release Auto-Updater (Portable Self-Replacement)
+        // =====================================================================
+        private void CheckForUpdatesAsync(bool isManual)
+        {
+            if (_isCheckingUpdate) return;
+            _isCheckingUpdate = true;
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    if (!isManual)
+                    {
+                        Thread.Sleep(1500);
+                    }
+                    CheckForUpdatesWorker(isManual);
+                }
+                catch (Exception ex)
+                {
+                    if (isManual && IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(() =>
+                        {
+                            MessageBox.Show(
+                                this,
+                                "업데이트 확인 중 오류가 발생했습니다:\n" + ex.Message,
+                                "업데이트 확인",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Warning);
+                        }));
+                    }
+                }
+                finally
+                {
+                    _isCheckingUpdate = false;
+                }
+            });
+        }
+
+        private void CheckForUpdatesWorker(bool isManual)
+        {
+            // Enable TLS 1.2 (0x00000C00) for GitHub HTTPS API
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+
+            string apiUrl = "https://api.github.com/repos/" + GitHubRepo + "/releases/latest";
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(apiUrl);
+            req.Method = "GET";
+            req.UserAgent = "Navigator-Hourglass-Updater/" + AppVersion;
+            req.Accept = "application/vnd.github+json";
+            req.Timeout = 10000;
+
+            string json;
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+            {
+                json = sr.ReadToEnd();
+            }
+
+            string remoteTag = ExtractJsonField(json, "tag_name");
+            if (string.IsNullOrEmpty(remoteTag))
+            {
+                if (isManual && IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        MessageBox.Show(this, "최신 릴리즈 정보를 찾을 수 없습니다.", "업데이트 확인", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }));
+                }
+                return;
+            }
+
+            Version localVer = ParseVersionString(AppVersion);
+            Version remoteVer = ParseVersionString(remoteTag);
+
+            if (remoteVer > localVer)
+            {
+                string exeUrl = ExtractAssetDownloadUrl(json, "Hourglass.exe");
+                string zipUrl = ExtractAssetDownloadUrl(json, "_Portable.zip");
+
+                if (string.IsNullOrEmpty(exeUrl))
+                {
+                    exeUrl = "https://github.com/" + GitHubRepo + "/releases/download/" + remoteTag + "/Hourglass.exe";
+                }
+                if (string.IsNullOrEmpty(zipUrl))
+                {
+                    zipUrl = "https://github.com/" + GitHubRepo + "/releases/download/" + remoteTag + "/Hourglass_" + remoteTag + "_Portable.zip";
+                }
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        string promptMsg = string.Format(
+                            "새로운 버전({0})이 GitHub에 출시되었습니다!\n(현재 버전: v{1})\n\n지금 최신 버전을 다운로드하여 포터블 실행 파일을 자동으로 교체(업데이트)하시겠습니까?",
+                            remoteTag, AppVersion);
+
+                        DialogResult dr = MessageBox.Show(
+                            this,
+                            promptMsg,
+                            "새로운 업데이트 발견 (Update Available)",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Information);
+
+                        if (dr == DialogResult.Yes)
+                        {
+                            DownloadAndReplacePortable(remoteTag, exeUrl, zipUrl);
+                        }
+                    }));
+                }
+            }
+            else if (isManual && IsHandleCreated && !IsDisposed)
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    MessageBox.Show(
+                        this,
+                        string.Format("현재 최신 버전(v{0})을 사용 중입니다.", AppVersion),
+                        "업데이트 확인",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }));
+            }
+        }
+
+        private void DownloadAndReplacePortable(string remoteTag, string exeUrl, string zipUrl)
+        {
+            ShowHudTemporarily("UPDATING TO " + remoteTag + "...", 15000);
+            RenderLayeredWindow();
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+
+                    string currentExe = Application.ExecutablePath;
+                    string appDir = Path.GetDirectoryName(currentExe);
+                    string newExePath = currentExe + ".new";
+                    string oldExePath = currentExe + ".old";
+
+                    // 1. Download new Hourglass.exe
+                    DownloadFileWithUserAgent(exeUrl, newExePath);
+
+                    // Verify downloaded file is a valid PE executable (> 10KB)
+                    FileInfo fi = new FileInfo(newExePath);
+                    if (!fi.Exists || fi.Length < 10240)
+                    {
+                        throw new Exception("다운로드된 실행 파일이 올바르지 않습니다.");
+                    }
+
+                    // 2. If there is a Portable .zip file in the same folder, update/replace it too
+                    try
+                    {
+                        string[] existingZips = Directory.GetFiles(appDir, "Hourglass*_Portable.zip");
+                        if (existingZips != null && existingZips.Length > 0 && !string.IsNullOrEmpty(zipUrl))
+                        {
+                            string targetZipName = Path.Combine(appDir, "Hourglass_" + remoteTag + "_Portable.zip");
+                            string tempZip = targetZipName + ".new";
+                            DownloadFileWithUserAgent(zipUrl, tempZip);
+                            foreach (string oldZ in existingZips)
+                            {
+                                try { File.Delete(oldZ); } catch { }
+                            }
+                            if (File.Exists(targetZipName)) File.Delete(targetZipName);
+                            File.Move(tempZip, targetZipName);
+                        }
+                    }
+                    catch
+                    {
+                        // Optional zip replacement; ignore if zip asset isn't present
+                    }
+
+                    // 3. Self-replace running portable executable
+                    SaveSettings();
+
+                    bool directReplaced = false;
+                    try
+                    {
+                        if (File.Exists(oldExePath)) File.Delete(oldExePath);
+                        File.Move(currentExe, oldExePath);
+                        File.Move(newExePath, currentExe);
+                        directReplaced = true;
+                    }
+                    catch
+                    {
+                        directReplaced = false;
+                    }
+
+                    if (directReplaced)
+                    {
+                        Process.Start(new ProcessStartInfo()
+                        {
+                            FileName = currentExe,
+                            WorkingDirectory = appDir,
+                            UseShellExecute = true
+                        });
+                    }
+                    else
+                    {
+                        // Fallback batch script replacement after process exit
+                        string cmdPath = Path.Combine(appDir, "hourglass_update.cmd");
+                        string cmdContent =
+                            "@echo off\r\n" +
+                            "ping 127.0.0.1 -n 2 > nul\r\n" +
+                            "move /Y \"" + newExePath + "\" \"" + currentExe + "\" > nul\r\n" +
+                            "start \"\" \"" + currentExe + "\"\r\n" +
+                            "del \"%~f0\"\r\n";
+                        File.WriteAllText(cmdPath, cmdContent, Encoding.Default);
+
+                        Process.Start(new ProcessStartInfo()
+                        {
+                            FileName = "cmd.exe",
+                            Arguments = "/C \"" + cmdPath + "\"",
+                            WorkingDirectory = appDir,
+                            WindowStyle = ProcessWindowStyle.Hidden,
+                            CreateNoWindow = true,
+                            UseShellExecute = false
+                        });
+                    }
+
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(() => Close()));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(() =>
+                        {
+                            MessageBox.Show(
+                                this,
+                                "자동 업데이트 중 오류가 발생했습니다:\n" + ex.Message,
+                                "업데이트 실패",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Error);
+                        }));
+                    }
+                }
+            });
+        }
+
+        private static void DownloadFileWithUserAgent(string url, string destPath)
+        {
+            if (File.Exists(destPath)) File.Delete(destPath);
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.UserAgent = "Navigator-Hourglass-Updater/" + AppVersion;
+            req.AllowAutoRedirect = true;
+            req.Timeout = 20000;
+
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+            using (Stream inStream = resp.GetResponseStream())
+            using (FileStream outStream = new FileStream(destPath, FileMode.Create, FileAccess.Write))
+            {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = inStream.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    outStream.Write(buffer, 0, read);
+                }
+            }
+        }
+
+        private static Version ParseVersionString(string verStr)
+        {
+            if (string.IsNullOrEmpty(verStr)) return new Version(0, 0, 0, 0);
+            string cleaned = verStr.Trim().TrimStart('v', 'V');
+            int dash = cleaned.IndexOf('-');
+            if (dash > 0) cleaned = cleaned.Substring(0, dash);
+            Version v;
+            if (Version.TryParse(cleaned, out v)) return v;
+            return new Version(0, 0, 0, 0);
+        }
+
+        private static string ExtractJsonField(string json, string fieldName)
+        {
+            Match m = Regex.Match(json, "\"" + Regex.Escape(fieldName) + "\"\\s*:\\s*\"([^\"]+)\"");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        private static string ExtractAssetDownloadUrl(string json, string fileSuffix)
+        {
+            MatchCollection matches = Regex.Matches(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]+)\"");
+            foreach (Match m in matches)
+            {
+                string url = m.Groups[1].Value;
+                if (url.EndsWith(fileSuffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return url;
+                }
+            }
+            return null;
         }
 
         // =====================================================================
@@ -1334,12 +1751,16 @@ namespace HourglassApp
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                 g.CompositingQuality = CompositingQuality.HighQuality;
 
-                // Split background: Left half medium-dark desktop, Right half light-warm desktop
-                using (SolidBrush darkDesk = new SolidBrush(Color.FromArgb(255, 42, 46, 52)))
+                // Simulated desktop background per column to clearly show transparent glass interior
+                int colW = w / 4;
                 using (SolidBrush lightDesk = new SolidBrush(Color.FromArgb(255, 212, 210, 204)))
+                using (SolidBrush darkDesk = new SolidBrush(Color.FromArgb(255, 42, 46, 52)))
+                using (Pen gridPen = new Pen(Color.FromArgb(40, 128, 134, 142), 1f))
                 {
-                    g.FillRectangle(darkDesk, 0, 0, w / 2, h);
-                    g.FillRectangle(lightDesk, w / 2, 0, w - w / 2, h);
+                    g.FillRectangle(lightDesk, 0, 0, colW, h);
+                    g.FillRectangle(darkDesk, colW, 0, w - colW, h);
+                    for (int gx = 0; gx < w; gx += 24) g.DrawLine(gridPen, gx, 0, gx, h);
+                    for (int gy = 0; gy < h; gy += 24) g.DrawLine(gridPen, 0, gy, w, gy);
                 }
 
                 // Sample 1: Transparent Line-Art Mode (Light Ink)
@@ -1380,10 +1801,18 @@ namespace HourglassApp
 
         private void DrawPreviewCell(Graphics g, int x, int y)
         {
-            GraphicsState st = g.Save();
-            g.TranslateTransform(x, y);
-            DrawScene(g);
-            g.Restore(st);
+            _showDigitalTime = true;
+            using (Bitmap cellBmp = new Bitmap(BaseWidth, BaseHeight, PixelFormat.Format32bppArgb))
+            using (Graphics cg = Graphics.FromImage(cellBmp))
+            {
+                cg.Clear(Color.Transparent);
+                cg.SmoothingMode = SmoothingMode.AntiAlias;
+                cg.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                cg.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                cg.CompositingQuality = CompositingQuality.HighQuality;
+                DrawScene(cg);
+                g.DrawImage(cellBmp, new Rectangle(x, y, BaseWidth, BaseHeight));
+            }
         }
 
         public void HideTrayForRender()
@@ -1398,6 +1827,7 @@ namespace HourglassApp
             bool isFlipping, float flipProgress,
             string hudText, long simMs)
         {
+            _showDigitalTime = true;
             _panelMode = panelMode;
             _themeIndex = themeIndex;
             _state = state;
@@ -1417,11 +1847,20 @@ namespace HourglassApp
                 _hudShowUntilMs = 0;
             }
 
-            GraphicsState st = g.Save();
-            g.TranslateTransform(x, y);
-            g.ScaleTransform(scale, scale);
-            DrawSceneAtTime(g, simMs);
-            g.Restore(st);
+            int w = (int)Math.Round(BaseWidth * scale);
+            int h = (int)Math.Round(BaseHeight * scale);
+            using (Bitmap layerBmp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+            using (Graphics lg = Graphics.FromImage(layerBmp))
+            {
+                lg.Clear(Color.Transparent);
+                lg.SmoothingMode = SmoothingMode.AntiAlias;
+                lg.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                lg.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                lg.CompositingQuality = CompositingQuality.HighQuality;
+                lg.ScaleTransform(scale, scale);
+                DrawSceneAtTime(lg, simMs);
+                g.DrawImage(layerBmp, x, y);
+            }
         }
 
         // =====================================================================
@@ -1429,7 +1868,7 @@ namespace HourglassApp
         // =====================================================================
         private void RenderLayeredWindow()
         {
-            if (!IsHandleCreated || IsDisposed || Width <= 0 || Height <= 0) return;
+            if (_isMinimizedToTray || !IsHandleCreated || IsDisposed || Width <= 0 || Height <= 0) return;
 
             if (_canvasBitmap == null || _canvasBitmap.Width != Width || _canvasBitmap.Height != Height)
             {
@@ -1649,14 +2088,6 @@ namespace HourglassApp
             DrawGraduatedScalePillar(g, pal, cx + pillarXOffset, topY, botY, false);
 
             // 2. Center Neck Crosshair / Reticle (Image 1 Attitude Indicator style)
-            if (!_panelMode)
-            {
-                using (Pen haloPen = new Pen(pal.PaperBg, 3.2f))
-                {
-                    g.DrawLine(haloPen, cx - pillarXOffset + 3f, neckY, cx - neckHalfW - 4f, neckY);
-                    g.DrawLine(haloPen, cx + neckHalfW + 4f, neckY, cx + pillarXOffset - 3f, neckY);
-                }
-            }
             using (Pen dashedPen = new Pen(pal.InkSecondary, 1.0f))
             {
                 dashedPen.DashStyle = DashStyle.Dot;
@@ -1680,39 +2111,22 @@ namespace HourglassApp
                 });
             }
 
-            // 3. Build Hourglass Chamber Paths
+            // 3. Build Hourglass Chamber Paths (Glass interior is 100% transparent except for outline & sand!)
             using (GraphicsPath upperBulbPath = CreateUpperBulbPath(cx, topY, neckY, halfW, neckHalfW))
             using (GraphicsPath lowerBulbPath = CreateLowerBulbPath(cx, neckY, botY, halfW, neckHalfW))
             using (GraphicsPath fullGlassPath = CreateFullGlassPath(cx, topY, neckY, botY, halfW, neckHalfW))
             {
-                // In Transparent Mode, fill the inside of the hourglass chamber with E-Ink paper so
-                // the inner dot-matrix sand and hairlines have crisp contrast, while outside is 100% transparent!
-                if (!_panelMode)
+                // Punch out glass interior to be completely transparent even in Panel Mode
+                if (_panelMode)
                 {
-                    using (Pen outerHaloPen = new Pen(pal.PaperBg, 4.5f))
+                    CompositingMode prevComp = g.CompositingMode;
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    using (SolidBrush clearBrush = new SolidBrush(Color.FromArgb(0, 0, 0, 0)))
                     {
-                        outerHaloPen.LineJoin = LineJoin.Round;
-                        g.DrawPath(outerHaloPen, fullGlassPath);
+                        g.FillPath(clearBrush, fullGlassPath);
                     }
-                    using (SolidBrush chamberBg = new SolidBrush(pal.PaperBg))
-                    {
-                        g.FillPath(chamberBg, fullGlassPath);
-                    }
+                    g.CompositingMode = prevComp;
                 }
-                // Fill glass interior with subtle ghost grid dots (E-Ink texture)
-                GraphicsState bgClip = g.Save();
-                g.SetClip(fullGlassPath, CombineMode.Intersect);
-                using (SolidBrush ghostBrush = new SolidBrush(pal.InkGhost))
-                {
-                    for (float py = topY + 4f; py < botY - 2f; py += 6f)
-                    {
-                        for (float px = cx - halfW; px <= cx + halfW; px += 6f)
-                        {
-                            g.FillRectangle(ghostBrush, px - 0.6f, py - 0.6f, 1.2f, 1.2f);
-                        }
-                    }
-                }
-                g.Restore(bgClip);
 
                 // 4. Draw Ink + Dot-Matrix Sand & Falling Pixel Stream
                 DrawDotMatrixSand(
@@ -1721,7 +2135,7 @@ namespace HourglassApp
                     cx, topY, neckY, botY, halfW,
                     progress, nowMs);
 
-                // 5. Crisp Technical Double-Line Glass Wall Contour
+                // 5. Crisp Technical Glass Wall Contour (Outline only, interior remains transparent)
                 Color contourColor = (_state == TimerState.Alarm && ((nowMs / 220) % 2 == 0))
                     ? pal.AccentInk
                     : pal.InkPrimary;
@@ -1755,14 +2169,6 @@ namespace HourglassApp
 
         private void DrawGraduatedScalePillar(Graphics g, EInkPalette pal, float x, float topY, float botY, bool isLeft)
         {
-            if (!_panelMode)
-            {
-                using (Pen haloSpine = new Pen(pal.PaperBg, 4.2f))
-                {
-                    g.DrawLine(haloSpine, x, topY, x, botY);
-                }
-            }
-
             using (Pen mainLinePen = new Pen(pal.InkPrimary, 1.5f))
             using (Pen minorTickPen = new Pen(pal.InkSecondary, 1.0f))
             {
@@ -1868,10 +2274,6 @@ namespace HourglassApp
                         {
                             g.FillRectangle(inkBrush, px - 1.1f, localY - 2.4f, 2.2f, 2.2f);
                         }
-                        else
-                        {
-                            g.FillRectangle(paperBrush, px - 1.0f, localY + 0.8f, 2.0f, 2.0f);
-                        }
                     }
 
                     g.Restore(clipState);
@@ -1911,10 +2313,6 @@ namespace HourglassApp
                         if (((int)Math.Round((px - cx) / step)) % 2 == 0)
                         {
                             g.FillRectangle(inkBrush, px - 1.1f, slopeY - 2.4f, 2.2f, 2.2f);
-                        }
-                        else
-                        {
-                            g.FillRectangle(paperBrush, px - 1.0f, slopeY + 0.8f, 2.0f, 2.0f);
                         }
                     }
 

@@ -14,6 +14,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 [assembly: AssemblyTitle("NAVIGATOR // E-Ink Hourglass")]
 [assembly: AssemblyDescription("Ultra-lightweight E-Ink & Technical Instrument Hourglass Timer for Windows")]
@@ -21,8 +22,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Navigator Instruments")]
 [assembly: AssemblyProduct("NAVIGATOR Hourglass Widget")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
 
 namespace HourglassApp
 {
@@ -205,6 +206,13 @@ namespace HourglassApp
         Alarm
     }
 
+    public enum RepeatMode
+    {
+        Off = 0,      // 기본 1회 타이머 모드
+        Interval = 1, // 정해진 시간마다 자동 반복 알림 모드
+        Hourly = 2    // 매 정시(00분)마다 자동 알림 모드 (원형 안 C 아이콘)
+    }
+
     public sealed class EInkPalette
     {
         public string Name;
@@ -300,8 +308,9 @@ namespace HourglassApp
 
         // Base canvas dimensions at 1.0x scale
         private const int BaseWidth = 210;
-        private const int BaseHeight = 310;
-        public const string AppVersion = "1.2.0";
+        private const int CardHeight = 310;
+        private const int BaseHeight = 340;
+        public const string AppVersion = "1.3.0";
         private const string GitHubRepo = "vegitaprince/navigator-hourglass";
         private bool _isCheckingUpdate = false;
 
@@ -310,9 +319,14 @@ namespace HourglassApp
 
         // State & Timing
         private TimerState _state = TimerState.Ready;
+        private RepeatMode _repeatMode = RepeatMode.Off;
         private double _totalSeconds = 300.0; // Default 5 minutes
+        private double _savedManualTotalSeconds = 300.0;
         private double _remainingSeconds = 300.0;
         private long _lastTickTimestamp;
+        private int _lastHourlyChimeHourKey = -1;
+        private long _autoRepeatFlashUntilMs = 0;
+        private long _autoRepeatSecondChimeAtMs = 0;
         private readonly Stopwatch _clock = Stopwatch.StartNew();
 
         // Animation & Visual State
@@ -333,6 +347,13 @@ namespace HourglassApp
         // Temporary HUD overlay when scrolling mouse wheel
         private long _hudShowUntilMs = 0;
         private string _hudCustomText = null;
+
+        // Temporary Mode Description Banner below the time box (shown on first use of each repeat mode)
+        private string _modeDescBannerText = null;
+        private long _modeDescBannerUntilMs = 0;
+        private bool _repeatDescShownInterval = false;
+        private bool _repeatDescShownHourly = false;
+        private bool _repeatDescShownOff = false;
 
         // Alarm state
         private long _alarmStartMs = 0;
@@ -358,10 +379,14 @@ namespace HourglassApp
         private ToolStripMenuItem _menuMinimizeRestore;
         private ToolStripMenuItem _menuModeTransparent;
         private ToolStripMenuItem _menuModePanel;
+        private ToolStripMenuItem _menuRepeatOff;
+        private ToolStripMenuItem _menuRepeatInterval;
+        private ToolStripMenuItem _menuRepeatHourly;
         private ToolStripMenuItem _menuAlwaysOnTop;
         private ToolStripMenuItem _menuShowTime;
         private ToolStripMenuItem _menuSound;
         private bool _isMinimizedToTray = false;
+        private bool _trayTipShown = false;
         private int _lastTraySandStep = -1;
         private int _lastTrayAnimPhase = -1;
         private TimerState _lastTrayState = TimerState.Ready;
@@ -406,17 +431,17 @@ namespace HourglassApp
                     Color.FromArgb(255, 105, 75),  // alarm accent
                     Color.FromArgb(112, 20, 23, 28)), // semi-transparent smoked dark glass (~44% alpha)
 
-                // 2: Warm Cream Paper (Braun / Industrial Blueprint)
+                // 2: Warm Cream Paper (Rich Vintage Cream & Warm Espresso Sepia Ink)
                 new EInkPalette(
                     "웜 크림 계기판",
-                    Color.FromArgb(240, 235, 222), // warm vintage paper
-                    Color.FromArgb(222, 216, 202), // warm putty bezel
-                    Color.FromArgb(182, 175, 162),
-                    Color.FromArgb(36, 32, 28),    // espresso ink
-                    Color.FromArgb(118, 110, 98),
-                    Color.FromArgb(220, 214, 200),
-                    Color.FromArgb(210, 75, 35),
-                    Color.FromArgb(105, 246, 240, 226)),
+                    Color.FromArgb(245, 224, 182), // #F5E0B6 rich warm golden-cream paper
+                    Color.FromArgb(228, 198, 146), // #E4C692 warm sandstone bezel
+                    Color.FromArgb(182, 144, 92),  // #B6905C warm brass inner lip
+                    Color.FromArgb(96, 52, 18),    // #603412 rich espresso-sepia brown ink
+                    Color.FromArgb(158, 106, 54),  // #9E6A36 warm bronze tick marks
+                    Color.FromArgb(224, 196, 148), // #E0C494 warm cream ghost matrix dots
+                    Color.FromArgb(212, 68, 22),   // #D44416 burnt vermilion accent
+                    Color.FromArgb(125, 250, 228, 180)), // warm cream semi-transparent glass
 
                 // 3: Cockpit Amber (Night Instrument Panel)
                 new EInkPalette(
@@ -546,8 +571,40 @@ namespace HourglassApp
                         if (double.TryParse(val, out s) && s >= 5 && s <= 86400)
                         {
                             _totalSeconds = s;
+                            _savedManualTotalSeconds = s;
                             _remainingSeconds = s;
                         }
+                    }
+                    else if (key == "SavedManualSeconds")
+                    {
+                        double s;
+                        if (double.TryParse(val, out s) && s >= 5 && s <= 86400)
+                        {
+                            _savedManualTotalSeconds = s;
+                        }
+                    }
+                    else if (key == "RepeatMode")
+                    {
+                        int rm;
+                        if (int.TryParse(val, out rm) && rm >= 0 && rm <= 2)
+                        {
+                            _repeatMode = (RepeatMode)rm;
+                        }
+                    }
+                    else if (key == "RepeatDescShownInterval")
+                    {
+                        bool b;
+                        if (bool.TryParse(val, out b)) _repeatDescShownInterval = b;
+                    }
+                    else if (key == "RepeatDescShownHourly")
+                    {
+                        bool b;
+                        if (bool.TryParse(val, out b)) _repeatDescShownHourly = b;
+                    }
+                    else if (key == "RepeatDescShownOff")
+                    {
+                        bool b;
+                        if (bool.TryParse(val, out b)) _repeatDescShownOff = b;
                     }
                     else if (key == "Scale")
                     {
@@ -581,6 +638,11 @@ namespace HourglassApp
                         if (int.TryParse(val, out ti) && ti >= 0 && ti < _themes.Length)
                             _themeIndex = ti;
                     }
+                    else if (key == "TrayTipShown")
+                    {
+                        bool b;
+                        if (bool.TryParse(val, out b)) _trayTipShown = b;
+                    }
                     else if (key == "X")
                     {
                         if (int.TryParse(val, out savedX)) hasPos = true;
@@ -605,6 +667,12 @@ namespace HourglassApp
                     }
                     if (visible) Location = pt;
                 }
+
+                if (_repeatMode == RepeatMode.Hourly)
+                {
+                    SyncHourlyClockState(true);
+                    _state = TimerState.Running;
+                }
             }
             catch
             {
@@ -615,15 +683,22 @@ namespace HourglassApp
         {
             try
             {
+                double manualSec = (_repeatMode == RepeatMode.Hourly) ? _savedManualTotalSeconds : _totalSeconds;
                 string[] lines = new string[]
                 {
-                    "TotalSeconds=" + _totalSeconds.ToString("F0"),
+                    "TotalSeconds=" + manualSec.ToString("F0"),
+                    "SavedManualSeconds=" + _savedManualTotalSeconds.ToString("F0"),
+                    "RepeatMode=" + (int)_repeatMode,
+                    "RepeatDescShownInterval=" + _repeatDescShownInterval,
+                    "RepeatDescShownHourly=" + _repeatDescShownHourly,
+                    "RepeatDescShownOff=" + _repeatDescShownOff,
                     "Scale=" + _scale.ToString("F2"),
                     "AlwaysOnTop=" + _alwaysOnTop,
                     "ShowDigitalTime=" + _showDigitalTime,
                     "SoundEnabled=" + _soundEnabled,
                     "PanelMode=" + _panelMode,
                     "ThemeIndex=" + _themeIndex,
+                    "TrayTipShown=" + _trayTipShown,
                     "X=" + Location.X,
                     "Y=" + Location.Y
                 };
@@ -724,12 +799,15 @@ namespace HourglassApp
         {
             _isMinimizedToTray = true;
             Hide();
+            PromoteTrayIconOnTaskbar();
             UpdateMenuChecks();
             UpdateTrayTooltip();
             UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
             EnsureTimerState();
-            if (_trayIcon != null)
+            if (!_trayTipShown && _trayIcon != null)
             {
+                _trayTipShown = true;
+                SaveSettings();
                 try
                 {
                     _trayIcon.ShowBalloonTip(
@@ -815,11 +893,12 @@ namespace HourglassApp
 
             // Quick Presets
             var menuPresets = new ToolStripMenuItem("빠른 시간 설정 (마우스 휠)");
-            int[] presetSeconds = new int[] { 30, 60, 180, 300, 600, 900, 1500, 1800, 2700, 3600 };
+            int[] presetSeconds = new int[] { 30, 60, 180, 300, 600, 900, 1500, 1800, 2700, 3600, 5400, 7200, 10800 };
             string[] presetNames = new string[]
             {
                 "30초", "1분", "3분", "5분", "10분",
-                "15분", "25분 (포모도로)", "30분", "45분", "60분 (1시간)"
+                "15분", "25분 (포모도로)", "30분", "45분", "1시간 (60분)",
+                "1시간 30분 (90분)", "2시간 (120분)", "3시간 (180분)"
             };
             for (int i = 0; i < presetSeconds.Length; i++)
             {
@@ -831,6 +910,16 @@ namespace HourglassApp
 
             var menuCustomTime = new ToolStripMenuItem("시간 직접 입력...", null, (s, e) => ShowCustomTimeDialog());
             _contextMenu.Items.Add(menuCustomTime);
+
+            // Repeat Mode Submenu
+            var menuRepeat = new ToolStripMenuItem("자동 반복 알림 모드 (하단 반복 아이콘 클릭)");
+            _menuRepeatOff = new ToolStripMenuItem("기본 모드 (1회 알림 후 정지)", null, (s, e) => SetRepeatMode(RepeatMode.Off, true));
+            _menuRepeatInterval = new ToolStripMenuItem("설정 시간마다 반복 알림 (예: 30분/2시간마다)", null, (s, e) => SetRepeatMode(RepeatMode.Interval, true));
+            _menuRepeatHourly = new ToolStripMenuItem("매 정시(00분)마다 알림 (원형 C 아이콘)", null, (s, e) => SetRepeatMode(RepeatMode.Hourly, true));
+            menuRepeat.DropDownItems.Add(_menuRepeatOff);
+            menuRepeat.DropDownItems.Add(_menuRepeatInterval);
+            menuRepeat.DropDownItems.Add(_menuRepeatHourly);
+            _contextMenu.Items.Add(menuRepeat);
 
             _contextMenu.Items.Add(new ToolStripSeparator());
 
@@ -924,6 +1013,9 @@ namespace HourglassApp
 
             _menuModeTransparent.Checked = !_panelMode;
             _menuModePanel.Checked = _panelMode;
+            if (_menuRepeatOff != null) _menuRepeatOff.Checked = (_repeatMode == RepeatMode.Off);
+            if (_menuRepeatInterval != null) _menuRepeatInterval.Checked = (_repeatMode == RepeatMode.Interval);
+            if (_menuRepeatHourly != null) _menuRepeatHourly.Checked = (_repeatMode == RepeatMode.Hourly);
             _menuAlwaysOnTop.Checked = _alwaysOnTop;
             _menuShowTime.Checked = _showDigitalTime;
             _menuSound.Checked = _soundEnabled;
@@ -959,6 +1051,49 @@ namespace HourglassApp
                     }
                 }
             };
+
+            // Automatically promote tray icon out of the '^' hidden overflow flyout onto the visible taskbar
+            PromoteTrayIconOnTaskbar();
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                Thread.Sleep(600);
+                PromoteTrayIconOnTaskbar();
+            });
+        }
+
+        private static void PromoteTrayIconOnTaskbar()
+        {
+            try
+            {
+                // Windows 11 stores per-tray-icon taskbar visibility in HKCU\Control Panel\NotifyIconSettings\<ID>\IsPromoted = 1
+                using (RegistryKey notifyRoot = Registry.CurrentUser.OpenSubKey(@"Control Panel\NotifyIconSettings", true))
+                {
+                    if (notifyRoot != null)
+                    {
+                        string[] subKeyNames = notifyRoot.GetSubKeyNames();
+                        foreach (string subName in subKeyNames)
+                        {
+                            using (RegistryKey itemKey = notifyRoot.OpenSubKey(subName, true))
+                            {
+                                if (itemKey == null) continue;
+                                string exePath = itemKey.GetValue("ExecutablePath") as string;
+                                if (!string.IsNullOrEmpty(exePath) &&
+                                    exePath.IndexOf("Hourglass.exe", StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    object curVal = itemKey.GetValue("IsPromoted");
+                                    if (!(curVal is int) || ((int)curVal) != 1)
+                                    {
+                                        itemKey.SetValue("IsPromoted", 1, RegistryValueKind.DWord);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
         }
 
         private void UpdateTrayIconDynamic(long nowMs, bool force)
@@ -1139,15 +1274,19 @@ namespace HourglassApp
         // =====================================================================
         private void EnsureTimerState()
         {
+            long nowMs = _clock.ElapsedMilliseconds;
             bool needsAnimation =
                 (_state == TimerState.Running) ||
                 (_state == TimerState.Alarm) ||
                 _isFlipping ||
-                (_clock.ElapsedMilliseconds < _hudShowUntilMs);
+                (nowMs < _hudShowUntilMs) ||
+                (nowMs < _modeDescBannerUntilMs) ||
+                (nowMs < _autoRepeatFlashUntilMs) ||
+                (_autoRepeatSecondChimeAtMs > 0);
 
             if (needsAnimation)
             {
-                int targetInterval = (_isFlipping || _state == TimerState.Alarm) ? 30 : 50;
+                int targetInterval = (_isFlipping || _state == TimerState.Alarm || nowMs < _autoRepeatFlashUntilMs) ? 30 : 50;
                 if (_animTimer.Interval != targetInterval)
                     _animTimer.Interval = targetInterval;
                 if (!_animTimer.Enabled)
@@ -1160,9 +1299,134 @@ namespace HourglassApp
             }
         }
 
+        private static int GetHourKey(DateTime dt)
+        {
+            return dt.Year * 1000000 + dt.DayOfYear * 100 + dt.Hour;
+        }
+
+        private void SyncHourlyClockState(bool initHourKey)
+        {
+            DateTime now = DateTime.Now;
+            double elapsedInHour = now.Minute * 60.0 + now.Second + now.Millisecond / 1000.0;
+            _totalSeconds = 3600.0;
+            _remainingSeconds = Math.Max(0.05, 3600.0 - elapsedInHour);
+            if (initHourKey)
+            {
+                _lastHourlyChimeHourKey = GetHourKey(now);
+            }
+        }
+
+        private void CycleRepeatMode()
+        {
+            RepeatMode nextMode;
+            if (_repeatMode == RepeatMode.Off)
+                nextMode = RepeatMode.Interval;
+            else if (_repeatMode == RepeatMode.Interval)
+                nextMode = RepeatMode.Hourly;
+            else
+                nextMode = RepeatMode.Off;
+
+            SetRepeatMode(nextMode, true);
+        }
+
+        private void SetRepeatMode(RepeatMode newMode, bool fromUserClick)
+        {
+            RepeatMode prevMode = _repeatMode;
+            _repeatMode = newMode;
+
+            if (newMode == RepeatMode.Interval)
+            {
+                if (prevMode == RepeatMode.Hourly)
+                {
+                    _totalSeconds = _savedManualTotalSeconds;
+                    _remainingSeconds = _totalSeconds;
+                }
+                if (_state != TimerState.Running)
+                {
+                    if (_remainingSeconds <= 0.05) _remainingSeconds = _totalSeconds;
+                    _state = TimerState.Running;
+                    _lastTickTimestamp = _clock.ElapsedMilliseconds;
+                }
+                ShowHudTemporarily("REPEAT // " + FormatTime(_totalSeconds), 1400);
+                if (fromUserClick && !_repeatDescShownInterval)
+                {
+                    _repeatDescShownInterval = true;
+                    ShowModeDescBanner("반복 알림: 설정 시간마다 자동 반복", 3200);
+                }
+            }
+            else if (newMode == RepeatMode.Hourly)
+            {
+                if (prevMode != RepeatMode.Hourly)
+                {
+                    _savedManualTotalSeconds = _totalSeconds;
+                }
+                SyncHourlyClockState(true);
+                _state = TimerState.Running;
+                _lastTickTimestamp = _clock.ElapsedMilliseconds;
+                ShowHudTemporarily("HOURLY // ON THE HOUR (C)", 1400);
+                if (fromUserClick && !_repeatDescShownHourly)
+                {
+                    _repeatDescShownHourly = true;
+                    ShowModeDescBanner("정시 알림(C): 매시간 정각마다 알림", 3200);
+                }
+            }
+            else // RepeatMode.Off
+            {
+                if (prevMode == RepeatMode.Hourly)
+                {
+                    _totalSeconds = _savedManualTotalSeconds;
+                    _remainingSeconds = _totalSeconds;
+                    _state = TimerState.Ready;
+                }
+                ShowHudTemporarily("SINGLE // REPEAT OFF", 1200);
+                if (fromUserClick && !_repeatDescShownOff)
+                {
+                    _repeatDescShownOff = true;
+                    ShowModeDescBanner("기본 모드: 1회 타이머 작동 (반복 해제)", 2800);
+                }
+            }
+
+            SaveSettings();
+            UpdateMenuChecks();
+            UpdateTrayTooltip();
+            UpdateTrayIconDynamic(_clock.ElapsedMilliseconds, true);
+            RenderLayeredWindow();
+            EnsureTimerState();
+        }
+
+        private void ShowModeDescBanner(string text, int durationMs)
+        {
+            _modeDescBannerText = text;
+            _modeDescBannerUntilMs = _clock.ElapsedMilliseconds + durationMs;
+            EnsureTimerState();
+        }
+
+        private void TriggerAutoRepeatCycle(string hudMsg)
+        {
+            long nowMs = _clock.ElapsedMilliseconds;
+            _isFlipping = true;
+            _flipProgress = 0.0f;
+            _flipStartMs = nowMs;
+            _autoRepeatFlashUntilMs = nowMs + 3400;
+            _autoRepeatSecondChimeAtMs = nowMs + 1600;
+
+            PlayAlarmChime();
+            ShowHudTemporarily(hudMsg, 2800);
+            UpdateTrayTooltip();
+            UpdateTrayIconDynamic(nowMs, true);
+            RenderLayeredWindow();
+            EnsureTimerState();
+        }
+
         private void OnAnimTimerTick(object sender, EventArgs e)
         {
             long nowMs = _clock.ElapsedMilliseconds;
+
+            if (_autoRepeatSecondChimeAtMs > 0 && nowMs >= _autoRepeatSecondChimeAtMs)
+            {
+                _autoRepeatSecondChimeAtMs = 0;
+                PlayAlarmChime();
+            }
 
             if (_isFlipping)
             {
@@ -1177,14 +1441,45 @@ namespace HourglassApp
 
             if (_state == TimerState.Running)
             {
-                double dt = (nowMs - _lastTickTimestamp) / 1000.0;
-                _lastTickTimestamp = nowMs;
-                _remainingSeconds -= dt;
-
-                if (_remainingSeconds <= 0.0)
+                if (_repeatMode == RepeatMode.Hourly)
                 {
-                    _remainingSeconds = 0.0;
-                    EnterAlarmState();
+                    DateTime now = DateTime.Now;
+                    int curHourKey = GetHourKey(now);
+                    double elapsedInHour = now.Minute * 60.0 + now.Second + now.Millisecond / 1000.0;
+                    _totalSeconds = 3600.0;
+                    _remainingSeconds = Math.Max(0.0, 3600.0 - elapsedInHour);
+                    _lastTickTimestamp = nowMs;
+
+                    if (_lastHourlyChimeHourKey != -1 && curHourKey != _lastHourlyChimeHourKey)
+                    {
+                        _lastHourlyChimeHourKey = curHourKey;
+                        TriggerAutoRepeatCycle(string.Format("정시 알림 // {0:D2}:00", now.Hour));
+                    }
+                    else if (_lastHourlyChimeHourKey == -1)
+                    {
+                        _lastHourlyChimeHourKey = curHourKey;
+                    }
+                }
+                else
+                {
+                    double dt = (nowMs - _lastTickTimestamp) / 1000.0;
+                    _lastTickTimestamp = nowMs;
+                    _remainingSeconds -= dt;
+
+                    if (_remainingSeconds <= 0.0)
+                    {
+                        if (_repeatMode == RepeatMode.Interval)
+                        {
+                            _remainingSeconds = _totalSeconds;
+                            _lastTickTimestamp = nowMs;
+                            TriggerAutoRepeatCycle("반복 알림 // " + FormatTime(_totalSeconds));
+                        }
+                        else
+                        {
+                            _remainingSeconds = 0.0;
+                            EnterAlarmState();
+                        }
+                    }
                 }
             }
             else if (_state == TimerState.Alarm)
@@ -1297,6 +1592,13 @@ namespace HourglassApp
             if (seconds < 10) seconds = 10;
             if (seconds > 36000) seconds = 36000;
 
+            _savedManualTotalSeconds = seconds;
+            if (_repeatMode == RepeatMode.Hourly)
+            {
+                _repeatMode = RepeatMode.Interval;
+                UpdateMenuChecks();
+            }
+
             _totalSeconds = seconds;
             _remainingSeconds = seconds;
             if (_state == TimerState.Alarm || _state == TimerState.Paused)
@@ -1364,6 +1666,15 @@ namespace HourglassApp
             }
         }
 
+        private RectangleF GetRepeatButtonBaseRect()
+        {
+            if (_panelMode)
+            {
+                return new RectangleF(165f, 221f, 22f, 22f);
+            }
+            return new RectangleF(156f, 229f, 22f, 22f);
+        }
+
         private void OnFormMouseUp(object sender, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
@@ -1376,6 +1687,21 @@ namespace HourglassApp
             {
                 SaveSettings();
                 return;
+            }
+
+            // Check if user clicked the Repeat Icon inside the bottom time box
+            if (_panelMode || _showDigitalTime || _state == TimerState.Paused || _state == TimerState.Alarm)
+            {
+                float bx = e.X / _scale;
+                float by = e.Y / _scale;
+                RectangleF hitRect = GetRepeatButtonBaseRect();
+                hitRect.Inflate(4f, 4f);
+                if (hitRect.Contains(bx, by))
+                {
+                    _lastClickMs = 0;
+                    CycleRepeatMode();
+                    return;
+                }
             }
 
             long now = _clock.ElapsedMilliseconds;
@@ -1894,33 +2220,43 @@ namespace HourglassApp
                     for (int gy = 0; gy < h; gy += 24) g.DrawLine(gridPen, 0, gy, w, gy);
                 }
 
-                // Sample 1: Transparent Line-Art Mode (Light Ink)
+                // Sample 1: Transparent Line-Art Mode (Light Ink, Repeat Off)
                 _panelMode = false;
                 _themeIndex = 0;
+                _repeatMode = RepeatMode.Off;
+                _modeDescBannerUntilMs = 0;
                 _state = TimerState.Running;
                 _totalSeconds = 300;
                 _remainingSeconds = 195; // 03:15
                 DrawPreviewCell(g, pad + 0 * (BaseWidth + pad), pad);
 
-                // Sample 2: Transparent Line-Art Mode (Dark Inverted Ink)
+                // Sample 2: Transparent Line-Art Mode (Dark Inverted Ink, Interval Repeat ON)
                 _panelMode = false;
                 _themeIndex = 1;
+                _repeatMode = RepeatMode.Interval;
+                _modeDescBannerText = "반복 알림: 설정 시간마다 자동 반복";
+                _modeDescBannerUntilMs = long.MaxValue;
                 _state = TimerState.Running;
-                _totalSeconds = 300;
-                _remainingSeconds = 142; // 02:22
+                _totalSeconds = 1800;
+                _remainingSeconds = 1042; // 17:22
                 DrawPreviewCell(g, pad + 1 * (BaseWidth + pad), pad);
 
-                // Sample 3: E-Ink Panel Card Mode (Light E-Paper)
+                // Sample 3: E-Ink Panel Card Mode (Warm Cream, Hourly 'C' Repeat ON)
                 _panelMode = true;
-                _themeIndex = 0;
+                _themeIndex = 2;
+                _repeatMode = RepeatMode.Hourly;
+                _modeDescBannerText = "정시 알림(C): 매시간 정각마다 알림";
+                _modeDescBannerUntilMs = long.MaxValue;
                 _state = TimerState.Running;
-                _totalSeconds = 1500;
-                _remainingSeconds = 1044; // 17:24
+                _totalSeconds = 3600;
+                _remainingSeconds = 2115; // 35:15
                 DrawPreviewCell(g, pad + 2 * (BaseWidth + pad), pad);
 
-                // Sample 4: E-Ink Panel Card Mode (Dark Inverted / OLED)
+                // Sample 4: E-Ink Panel Card Mode (Dark Inverted / OLED, Interval Repeat)
                 _panelMode = true;
                 _themeIndex = 1;
+                _repeatMode = RepeatMode.Interval;
+                _modeDescBannerUntilMs = 0;
                 _state = TimerState.Running;
                 _totalSeconds = 600;
                 _remainingSeconds = 315; // 05:15
@@ -2121,7 +2457,7 @@ namespace HourglassApp
 
             g.Restore(hgState);
 
-            // Bottom Readout Section (Dot-Matrix Digital Clock + Technical Gauge Bar)
+            // Bottom Readout Section (Dot-Matrix Digital Clock + Technical Gauge Bar + Repeat Icon)
             bool showTempHud = nowMs < _hudShowUntilMs;
             if (_panelMode)
             {
@@ -2131,6 +2467,12 @@ namespace HourglassApp
             {
                 DrawTransparentReadoutPlaque(g, pal, cx, 250f, progress, showTempHud, nowMs);
             }
+
+            // First-run Mode Description Toast Banner below the time box
+            if (nowMs < _modeDescBannerUntilMs && !string.IsNullOrEmpty(_modeDescBannerText))
+            {
+                DrawModeDescBanner(g, pal, cx, nowMs);
+            }
         }
 
         // =====================================================================
@@ -2139,14 +2481,14 @@ namespace HourglassApp
         private void DrawEInkPanelFrame(Graphics g, EInkPalette pal, float cx, double progress, long nowMs)
         {
             // Soft subtle hardware drop shadow
-            using (GraphicsPath shadowPath = CreateRoundedRect(6f, 8f, BaseWidth - 12f, BaseHeight - 10f, 10f))
+            using (GraphicsPath shadowPath = CreateRoundedRect(6f, 8f, BaseWidth - 12f, CardHeight - 10f, 10f))
             using (SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(65, 0, 0, 0)))
             {
                 g.FillPath(shadowBrush, shadowPath);
             }
 
             // Outer Hardware Bezel (like the white E-Ink frame in reference photos 2 & 3)
-            RectangleF bezelRect = new RectangleF(4f, 4f, BaseWidth - 8f, BaseHeight - 8f);
+            RectangleF bezelRect = new RectangleF(4f, 4f, BaseWidth - 8f, CardHeight - 8f);
             using (GraphicsPath bezelPath = CreateRoundedRect(bezelRect.X, bezelRect.Y, bezelRect.Width, bezelRect.Height, 8f))
             using (SolidBrush bezelBrush = new SolidBrush(pal.BezelOuter))
             using (Pen bezelBorder = new Pen(pal.InkPrimary, 1.6f))
@@ -2156,7 +2498,7 @@ namespace HourglassApp
             }
 
             // Inner E-Ink Matte Screen Surface
-            RectangleF screenRect = new RectangleF(13f, 13f, BaseWidth - 26f, BaseHeight - 26f);
+            RectangleF screenRect = new RectangleF(13f, 13f, BaseWidth - 26f, CardHeight - 26f);
             using (SolidBrush paperBrush = new SolidBrush(pal.PaperBg))
             using (Pen innerLipPen = new Pen(pal.BezelInner, 1.5f))
             using (Pen inkGridPen = new Pen(pal.InkPrimary, 1.3f))
@@ -2242,20 +2584,18 @@ namespace HourglassApp
                 });
             }
 
-            // 3. Build Hourglass Chamber Paths (Softly semi-transparent glass interior + subtle sheen)
+            // 3. Build Hourglass Chamber Paths (Opaque in E-Ink Panel Mode, Semi-transparent in Transparent Line-Art Mode)
             using (GraphicsPath upperBulbPath = CreateUpperBulbPath(cx, topY, neckY, halfW, neckHalfW))
             using (GraphicsPath lowerBulbPath = CreateLowerBulbPath(cx, neckY, botY, halfW, neckHalfW))
             using (GraphicsPath fullGlassPath = CreateFullGlassPath(cx, topY, neckY, botY, halfW, neckHalfW))
             {
                 if (_panelMode)
                 {
-                    CompositingMode prevComp = g.CompositingMode;
-                    g.CompositingMode = CompositingMode.SourceCopy;
-                    using (SolidBrush glassBrush = new SolidBrush(pal.GlassTint))
+                    Color opaqueGlass = Color.FromArgb(255, pal.GlassTint.R, pal.GlassTint.G, pal.GlassTint.B);
+                    using (SolidBrush glassBrush = new SolidBrush(opaqueGlass))
                     {
                         g.FillPath(glassBrush, fullGlassPath);
                     }
-                    g.CompositingMode = prevComp;
                 }
                 else
                 {
@@ -2504,17 +2844,19 @@ namespace HourglassApp
             Graphics g, EInkPalette pal, float cx,
             double progress, bool showTempHud, long nowMs)
         {
-            RectangleF screenRect = new RectangleF(13f, 13f, BaseWidth - 26f, BaseHeight - 26f);
+            RectangleF screenRect = new RectangleF(13f, 13f, BaseWidth - 26f, CardHeight - 26f);
             float topY = 216f;
 
-            // 1. Large 5x7 Dot-Matrix Clock (Image 3 style `17:24`)
+            // 1. Large 5x7 Dot-Matrix Clock (shifted slightly left to make room for Repeat Icon button)
             string clockStr = FormatTime(_remainingSeconds);
-            float dotPitch = clockStr.Length > 5 ? 2.6f : 3.4f;
-            Color activeDotColor = (_state == TimerState.Alarm && ((nowMs / 220) % 2 == 0))
-                ? pal.AccentInk
-                : pal.InkPrimary;
+            float dotPitch = clockStr.Length > 5 ? 2.5f : 3.3f;
+            bool isFlash = (_state == TimerState.Alarm || nowMs < _autoRepeatFlashUntilMs) && ((nowMs / 220) % 2 == 0);
+            Color activeDotColor = isFlash ? pal.AccentInk : pal.InkPrimary;
 
-            DrawDotMatrixCentered(g, clockStr, cx, topY + 6f, dotPitch, activeDotColor, pal.InkGhost);
+            DrawDotMatrixCentered(g, clockStr, cx - 11f, topY + 6f, dotPitch, activeDotColor, pal.InkGhost);
+
+            // Repeat Mode Icon Button inside the time readout box
+            DrawRepeatModeButton(g, pal, GetRepeatButtonBaseRect());
 
             // 2. Technical Sub-Label or Temporary Wheel HUD
             string subLabel;
@@ -2525,6 +2867,16 @@ namespace HourglassApp
             else if (_state == TimerState.Alarm)
             {
                 subLabel = ">>> TIME ELAPSED // CLICK <<<";
+            }
+            else if (_repeatMode == RepeatMode.Hourly)
+            {
+                int pct = (int)Math.Round(progress * 100.0);
+                subLabel = string.Format("HOURLY (C) | {0}% TO NEXT :00", pct);
+            }
+            else if (_repeatMode == RepeatMode.Interval)
+            {
+                int pct = (int)Math.Round(progress * 100.0);
+                subLabel = string.Format("REPEAT: {0}% | EVERY {1}", pct, FormatTime(_totalSeconds));
             }
             else
             {
@@ -2567,14 +2919,16 @@ namespace HourglassApp
             DrawScrewHead(g, pal, rect.Left + 6f, rect.Bottom - 6f, 2.3f);
             DrawScrewHead(g, pal, rect.Right - 6f, rect.Bottom - 6f, 2.3f);
 
-            // Dot-Matrix Digital Time inside the plaque
+            // Dot-Matrix Digital Time inside the plaque (shifted slightly left for Repeat Icon button)
             string clockStr = FormatTime(_remainingSeconds);
-            float dotPitch = clockStr.Length > 5 ? 2.4f : 3.0f;
-            Color activeDotColor = (_state == TimerState.Alarm && ((nowMs / 220) % 2 == 0))
-                ? pal.AccentInk
-                : pal.InkPrimary;
+            float dotPitch = clockStr.Length > 5 ? 2.3f : 2.9f;
+            bool isFlash = (_state == TimerState.Alarm || nowMs < _autoRepeatFlashUntilMs) && ((nowMs / 220) % 2 == 0);
+            Color activeDotColor = isFlash ? pal.AccentInk : pal.InkPrimary;
 
-            DrawDotMatrixCentered(g, clockStr, cx, rect.Top + 7f, dotPitch, activeDotColor, pal.InkGhost);
+            DrawDotMatrixCentered(g, clockStr, cx - 12f, rect.Top + 7f, dotPitch, activeDotColor, pal.InkGhost);
+
+            // Repeat Mode Icon Button inside the time box
+            DrawRepeatModeButton(g, pal, GetRepeatButtonBaseRect());
 
             // Bottom progress bar or temporary status text inside plaque
             if (showTempHud && !string.IsNullOrEmpty(_hudCustomText))
@@ -2590,6 +2944,119 @@ namespace HourglassApp
             {
                 RectangleF barRect = new RectangleF(rect.X + 16f, rect.Bottom - 14f, rect.Width - 32f, 8f);
                 DrawTechnicalProgressBar(g, pal, barRect, progress);
+            }
+        }
+
+        private void DrawRepeatModeButton(Graphics g, EInkPalette pal, RectangleF btnRect)
+        {
+            bool isActive = (_repeatMode != RepeatMode.Off);
+            Color bgCol = isActive ? pal.InkPrimary : Color.FromArgb(45, pal.InkSecondary.R, pal.InkSecondary.G, pal.InkSecondary.B);
+            Color fgCol = isActive ? pal.PaperBg : pal.InkSecondary;
+            Color borderCol = isActive ? pal.InkPrimary : pal.InkSecondary;
+
+            using (GraphicsPath btnPath = CreateRoundedRect(btnRect.X, btnRect.Y, btnRect.Width, btnRect.Height, 4.5f))
+            using (SolidBrush bgBrush = new SolidBrush(bgCol))
+            using (Pen borderPen = new Pen(borderCol, isActive ? 1.4f : 1.0f))
+            {
+                g.FillPath(bgBrush, btnPath);
+                g.DrawPath(borderPen, btnPath);
+            }
+
+            float bcx = btnRect.X + btnRect.Width * 0.5f;
+            float bcy = btnRect.Y + btnRect.Height * 0.5f;
+            float r = (_repeatMode == RepeatMode.Hourly) ? 7.2f : 6.5f;
+
+            using (Pen arcPen = new Pen(fgCol, isActive ? 1.65f : 1.35f))
+            using (SolidBrush headBrush = new SolidBrush(fgCol))
+            {
+                arcPen.StartCap = LineCap.Round;
+                arcPen.EndCap = LineCap.Round;
+
+                RectangleF arcBox = new RectangleF(bcx - r, bcy - r, r * 2f, r * 2f);
+                // Top-right clockwise arc (-150 deg to -25 deg)
+                g.DrawArc(arcPen, arcBox, -150f, 125f);
+                // Bottom-left clockwise arc (30 deg to 155 deg)
+                g.DrawArc(arcPen, arcBox, 30f, 125f);
+
+                // Arrowhead 1 at -25 deg (pointing down-right clockwise)
+                DrawCircularArrowhead(g, headBrush, bcx, bcy, r, -20f, true);
+                // Arrowhead 2 at 155 deg (pointing up-left clockwise)
+                DrawCircularArrowhead(g, headBrush, bcx, bcy, r, 160f, true);
+
+                // In Hourly Mode (정시 알림 모드), draw 'C' inside the circular repeat icon
+                if (_repeatMode == RepeatMode.Hourly)
+                {
+                    using (Font cFont = new Font("Consolas", 7.6f, FontStyle.Bold))
+                    using (StringFormat sf = new StringFormat()
+                    {
+                        Alignment = StringAlignment.Center,
+                        LineAlignment = StringAlignment.Center
+                    })
+                    {
+                        g.DrawString("C", cFont, headBrush, new RectangleF(bcx - 7f, bcy - 6.5f, 14f, 14f), sf);
+                    }
+                }
+            }
+        }
+
+        private static void DrawCircularArrowhead(
+            Graphics g, Brush brush, float cx, float cy, float r, float angleDeg, bool clockwise)
+        {
+            double rad = angleDeg * Math.PI / 180.0;
+            float tipX = cx + (float)(r * Math.Cos(rad));
+            float tipY = cy + (float)(r * Math.Sin(rad));
+
+            // Tangent direction for clockwise rotation
+            double tanAngle = rad + (clockwise ? Math.PI * 0.5 : -Math.PI * 0.5);
+            float backLen = 3.6f;
+            float wingW = 2.3f;
+
+            float baseX = tipX - (float)(backLen * Math.Cos(tanAngle));
+            float baseY = tipY - (float)(backLen * Math.Sin(tanAngle));
+
+            float perpX = (float)(wingW * Math.Cos(tanAngle + Math.PI * 0.5));
+            float perpY = (float)(wingW * Math.Sin(tanAngle + Math.PI * 0.5));
+
+            PointF[] pts = new PointF[]
+            {
+                new PointF(tipX + (float)(0.8 * Math.Cos(tanAngle)), tipY + (float)(0.8 * Math.Sin(tanAngle))),
+                new PointF(baseX + perpX, baseY + perpY),
+                new PointF(baseX - perpX, baseY - perpY)
+            };
+            g.FillPolygon(brush, pts);
+        }
+
+        private void DrawModeDescBanner(Graphics g, EInkPalette pal, float cx, long nowMs)
+        {
+            long remMs = _modeDescBannerUntilMs - nowMs;
+            if (remMs <= 0 || string.IsNullOrEmpty(_modeDescBannerText)) return;
+
+            int alpha = remMs < 400 ? (int)(255 * (remMs / 400.0)) : 255;
+            if (alpha < 15) return;
+
+            float bannerW = 204f;
+            float bannerH = 22f;
+            float bannerY = _panelMode ? (CardHeight + 3f) : 281f;
+            RectangleF rect = new RectangleF(cx - bannerW * 0.5f, bannerY, bannerW, bannerH);
+
+            Color bgCol = Color.FromArgb(alpha, pal.PaperBg.R, pal.PaperBg.G, pal.PaperBg.B);
+            Color borderCol = Color.FromArgb(alpha, pal.InkPrimary.R, pal.InkPrimary.G, pal.InkPrimary.B);
+            Color textCol = Color.FromArgb(alpha, pal.InkPrimary.R, pal.InkPrimary.G, pal.InkPrimary.B);
+
+            using (GraphicsPath path = CreateRoundedRect(rect.X, rect.Y, rect.Width, rect.Height, 5f))
+            using (SolidBrush bgBrush = new SolidBrush(bgCol))
+            using (Pen borderPen = new Pen(borderCol, 1.4f))
+            using (Font descFont = new Font("Malgun Gothic", 6.6f, FontStyle.Bold))
+            using (SolidBrush textBrush = new SolidBrush(textCol))
+            using (StringFormat sf = new StringFormat(StringFormatFlags.NoWrap)
+            {
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center
+            })
+            {
+                g.FillPath(bgBrush, path);
+                g.DrawPath(borderPen, path);
+                g.DrawString(_modeDescBannerText, descFont, textBrush, new PointF(cx, rect.Y + rect.Height * 0.52f), sf);
             }
         }
 
